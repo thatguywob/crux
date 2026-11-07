@@ -113,6 +113,10 @@ type Options struct {
 	Tolerations    []Toleration
 	Resources      Resources
 	ServiceAccount string
+	// SchedulerName is passed through as the pod's schedulerName, for clusters
+	// whose admission webhook requires device-requesting pods to use a custom
+	// scheduler. Empty leaves the cluster default.
+	SchedulerName string
 	// EnvFromSecrets are Secret names whose keys become environment variables
 	// in the Job. This is the ONLY credential path into the Job.
 	EnvFromSecrets []string
@@ -186,6 +190,10 @@ func (o Options) Validate() error {
 // left in place until its TTL so the operator can inspect it.
 func (l *Launcher) Run(ctx context.Context, spec sandbox.LaunchSpec) (sandbox.Result, error) {
 	var res sandbox.Result
+	if spec.ClineProvider != nil {
+		_ = spec.ClineProvider.Close()
+		return res, errors.New("kubejob: scoped Cline provider files are Podman-only; configure Job Secret references instead")
+	}
 	if err := l.Options.Validate(); err != nil {
 		return res, err
 	}
@@ -217,37 +225,50 @@ func (l *Launcher) Run(ctx context.Context, spec sandbox.LaunchSpec) (sandbox.Re
 	done, waitErr := l.wait(ctx, jobPath)
 	// Collect whatever the pod produced BEFORE deciding anything: a timed-out
 	// or failed kick with no transcript is the worst outcome for an operator.
-	// After a timeout the caller's ctx is already dead, so the collection and
-	// the cleanup below run on a fresh, request-bounded context.
-	collectCtx := ctx
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		collectCtx, cancel = context.WithTimeout(context.Background(), requestTimeout)
-		defer cancel()
+	// The caller's ctx may be dead already (kick timeout) or die between any
+	// two of these requests (cancel during log collection), so every step
+	// re-checks it and falls back to a fresh, request-bounded context.
+	// Otherwise a readable, Complete pod would report exitCodeUnknown merely
+	// because ctx was cancelled after the log was read.
+	var cancels []context.CancelFunc
+	defer func() {
+		for _, c := range cancels {
+			c()
+		}
+	}()
+	live := func() context.Context {
+		if ctx.Err() == nil {
+			return ctx
+		}
+		fresh, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		cancels = append(cancels, cancel)
+		return fresh
 	}
-	pod, podErr := l.findPod(collectCtx, ns, name)
+	pod, podErr := l.findPod(live(), ns, name)
 	if podErr == nil && pod != "" {
-		res.Stdout = l.podLog(collectCtx, ns, pod)
-		res.ExitCode = l.podExitCode(collectCtx, ns, pod)
+		res.Stdout = l.podLog(live(), ns, pod)
+		res.ExitCode = l.podExitCode(live(), ns, pod)
 	} else {
 		res.ExitCode = exitCodeUnknown
 	}
 	if waitErr != nil {
 		// Context ended (kick timeout or cancel). The Job would otherwise
 		// keep running the workload on the accelerator node; stop it.
-		_ = l.delete(collectCtx, jobPath)
+		_ = l.delete(live(), jobPath)
 		return res, waitErr
 	}
 	if !done.succeeded {
 		res.Stderr = done.reason
 		return res, fmt.Errorf("kubejob: job %s failed: %s", name, done.reason)
 	}
-	if res.ExitCode == exitCodeUnknown {
-		// The Job reports Complete, so the container exited 0 even though the
-		// pod could not be read back (already GC'd, or RBAC on pods missing).
-		res.ExitCode = 0
-	}
-	_ = l.delete(ctx, jobPath)
+	// When the Job reports Complete but the pod could not be read back
+	// (already GC'd, or RBAC on pods missing), res.ExitCode stays
+	// exitCodeUnknown rather than a guessed 0; callers treat a nil error with
+	// an unknown code as completed-without-code.
+	//
+	// Collection may have expired the context even on success; the fresh
+	// context ensures the finished Job is still removed immediately.
+	_ = l.delete(live(), jobPath)
 	return res, nil
 }
 
@@ -401,12 +422,16 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 		ttl = DefaultTTLSeconds
 	}
 
-	env := make([]map[string]string, 0, len(spec.Env))
-	for _, k := range sortedKeys(spec.Env) {
-		if sandbox.IsCredentialName(k) {
-			continue
+	// Same filter as the Podman path; explicit spec.Env entries come last and win.
+	merged := map[string]string{}
+	for _, entry := range sandbox.SanitizedEnv(os.Environ(), spec.EnvAllowlist, spec.Env) {
+		if k, v, ok := strings.Cut(entry, "="); ok {
+			merged[k] = v
 		}
-		env = append(env, map[string]string{"name": k, "value": spec.Env[k]})
+	}
+	env := make([]map[string]string, 0, len(merged))
+	for _, k := range sortedKeys(merged) {
+		env = append(env, map[string]string{"name": k, "value": merged[k]})
 	}
 	envFrom := make([]map[string]any, 0, len(l.Options.EnvFromSecrets))
 	for _, s := range l.Options.EnvFromSecrets {
@@ -434,6 +459,13 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 	}
 
 	container := map[string]any{
+		// The workspace PVC and the agent's home need to stay writable, so the
+		// root filesystem is deliberately not made read-only.
+		"securityContext": map[string]any{
+			"allowPrivilegeEscalation": false,
+			"capabilities":             map[string]any{"drop": []string{"ALL"}},
+			"seccompProfile":           map[string]string{"type": "RuntimeDefault"},
+		},
 		"name":         containerName,
 		"image":        spec.Image,
 		"workingDir":   workdir,
@@ -451,6 +483,12 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 		"restartPolicy": restartNever,
 		"containers":    []map[string]any{container},
 		"volumes":       volumes,
+		// Nothing in the kick pod calls the Kubernetes API, so the SA token is
+		// never mounted into a contained run.
+		"automountServiceAccountToken": false,
+		"securityContext": map[string]any{
+			"seccompProfile": map[string]string{"type": "RuntimeDefault"},
+		},
 	}
 	if len(l.Options.NodeSelector) > 0 {
 		podSpec["nodeSelector"] = l.Options.NodeSelector
@@ -460,6 +498,9 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 	}
 	if l.Options.ServiceAccount != "" {
 		podSpec["serviceAccountName"] = l.Options.ServiceAccount
+	}
+	if l.Options.SchedulerName != "" {
+		podSpec["schedulerName"] = l.Options.SchedulerName
 	}
 	labels := map[string]string{managedByLabel: managedByValue}
 	if spec.Name != "" {

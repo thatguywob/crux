@@ -32,6 +32,17 @@ func TestAllowedByMode(t *testing.T) {
 		{"issues-only allows PATCH issue", agent.ModeIssuesOnly, "PATCH", "/repos/org/repo/issues/42", true},
 		{"issues-only allows comment", agent.ModeIssuesOnly, "POST", "/repos/org/repo/issues/42/comments", true},
 		{"issues-only allows label", agent.ModeIssuesOnly, "POST", "/repos/org/repo/issues/42/labels", true},
+		// Spek publishes an RFC with sub-issue children and "blocked by" edges
+		// through the proxy (spektacular#114): the same two writes
+		// hive-open-issue --parent / --blocked-by make, at the issue tier.
+		{"issues-only allows add sub-issue", agent.ModeIssuesOnly, "POST", "/repos/org/repo/issues/42/sub_issues", true},
+		{"issues-only allows add blocked-by", agent.ModeIssuesOnly, "POST", "/repos/org/repo/issues/42/dependencies/blocked_by", true},
+		{"advisory blocks add sub-issue", agent.ModeAdvisory, "POST", "/repos/org/repo/issues/42/sub_issues", false},
+		{"advisory blocks add blocked-by", agent.ModeAdvisory, "POST", "/repos/org/repo/issues/42/dependencies/blocked_by", false},
+		{"sub-issue unlink stays denied", agent.ModeIssuesPRsMerge, "DELETE", "/repos/org/repo/issues/42/sub_issue", false},
+		{"sub-issue reprioritise stays denied", agent.ModeIssuesPRsMerge, "PATCH", "/repos/org/repo/issues/42/sub_issues/priority", false},
+		{"blocked-by unlink stays denied", agent.ModeIssuesPRsMerge, "DELETE", "/repos/org/repo/issues/42/dependencies/blocked_by/7", false},
+		{"blocking side is not a write route", agent.ModeIssuesPRsMerge, "POST", "/repos/org/repo/issues/42/dependencies/blocking", false},
 		{"issues-only blocks POST pulls", agent.ModeIssuesOnly, "POST", "/repos/org/repo/pulls", false},
 		{"issues-only blocks PATCH pull", agent.ModeIssuesOnly, "PATCH", "/repos/org/repo/pulls/42", false},
 		{"issues-only blocks PUT merge", agent.ModeIssuesOnly, "PUT", "/repos/org/repo/pulls/42/merge", false},
@@ -307,6 +318,10 @@ func TestIsGitHubHost(t *testing.T) {
 		{"github.com", true},
 		{"example.com", false},
 		{"api.github.com.evil.com", false},
+		{"API.GITHUB.COM", true},
+		{"Api.GitHub.com.", true},
+		{"github.com.", true},
+		{"evil-api.github.com", false},
 		{"", false},
 	}
 	for _, tt := range tests {
@@ -330,5 +345,34 @@ func TestNeedsMITM(t *testing.T) {
 		if got := NeedsMITM(tt.host); got != tt.want {
 			t.Errorf("NeedsMITM(%q) = %v, want %v", tt.host, got, tt.want)
 		}
+	}
+}
+
+func TestHostCanonicalization(t *testing.T) {
+	tests := []struct {
+		name string
+		fn   func(string) bool
+		host string
+		want bool
+	}{
+		{"inspection upper", NeedsInspection, "API.GITHUB.COM", true},
+		{"inspection mixed trailing dot", NeedsInspection, "Api.GitHub.com.", true},
+		{"inspection lookalike", NeedsInspection, "evil-api.github.com", false},
+		{"inspection empty", NeedsInspection, "", false},
+		{"mitm trailing dot", NeedsMITM, "api.github.com.", true},
+		{"linear upper", IsLinearHost, "API.LINEAR.APP", true},
+		{"linear trailing dot", IsLinearHost, "api.linear.app.", true},
+		{"linear lookalike", IsLinearHost, "evil-api.linear.app", false},
+		{"copilot upper", IsCopilotAPIHost, "API.GITHUBCOPILOT.COM", true},
+		{"copilot mixed trailing dot", IsCopilotAPIHost, "Api.GitHubCopilot.com.", true},
+		{"copilot lookalike", IsCopilotAPIHost, "evilgithubcopilot.com", false},
+		{"copilot empty", IsCopilotAPIHost, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fn(tt.host); got != tt.want {
+				t.Errorf("host %q = %v, want %v", tt.host, got, tt.want)
+			}
+		})
 	}
 }

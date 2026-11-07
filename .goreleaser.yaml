@@ -8,7 +8,7 @@ project_name: crux
 
 before:
   hooks:
-    - go mod download
+    - sh -c 'for i in 1 2 3; do go mod download && break; [ "$i" -eq 3 ] && exit 1; sleep 5; done'
 
 builds:
   - id: crux
@@ -20,7 +20,9 @@ builds:
     goarch: [amd64, arm64]
     flags: [-trimpath]
     ldflags:
-      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+      # cmd/crux/main.go declares only `version`; `crux --version` reports the
+      # tag and .hive-sync records the source commit, so nothing else is injected.
+      - -s -w -X main.version={{.Version}}
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
@@ -38,7 +40,10 @@ checksum:
 signs:
   - cmd: cosign
     # cosign v3 writes one sigstore bundle (certificate + signature + log entry).
-    # Verify: cosign verify-blob --bundle checksums.txt.sigstore.json checksums.txt
+    # Verify (identity and issuer pins are required for keyless; see README):
+    #   cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
+    #     --certificate-identity-regexp '^https://github\.com/hivecommons/crux/\.github/workflows/release\.yml@' \
+    #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
     signature: "${artifact}.sigstore.json"
     args:
       - sign-blob

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/hivecommons/crux/agent/tmux"
 	"github.com/hivecommons/crux/config"
+	"github.com/hivecommons/crux/internal/textutil"
 )
 
 // paneCaptureSleep is a pacing var, not a const, for the same reason as the
@@ -232,6 +234,27 @@ func outputErr(prefix string, err error, output []byte) error {
 }
 
 func (m *Manager) tmuxCmd(agent *AgentProcess, args ...string) *exec.Cmd {
+	name, argv := m.tmuxCommandLine(agent, args...)
+	return exec.Command(name, argv...)
+}
+
+// tmuxCmdContext is tmuxCmd bound to ctx: the tmux client is killed when ctx
+// is done, so a wedged tmux server (socket accepted, never answering) cannot
+// hold the caller past its deadline (#16097). WaitDelay bounds the wait for
+// the output pipes after the kill.
+func (m *Manager) tmuxCmdContext(ctx context.Context, agent *AgentProcess, args ...string) *exec.Cmd {
+	name, argv := m.tmuxCommandLine(agent, args...)
+	cmd := exec.CommandContext(ctx, name, argv...)
+	cmd.WaitDelay = tmuxCmdWaitDelay
+	return cmd
+}
+
+// tmuxCmdWaitDelay is how long a context-bound tmux command may keep its
+// output pipes open after ctx kills it.
+const tmuxCmdWaitDelay = time.Second
+
+// tmuxCommandLine returns the program and argv tmuxCmd/tmuxCmdContext run.
+func (m *Manager) tmuxCommandLine(agent *AgentProcess, args ...string) (string, []string) {
 	if err := validateTmuxKillSessionArgs(args); err != nil {
 		agentName := ""
 		if agent != nil {
@@ -240,16 +263,16 @@ func (m *Manager) tmuxCmd(agent *AgentProcess, args ...string) *exec.Cmd {
 		if m.logger != nil {
 			m.logger.Warn("refusing unsafe tmux kill-session", "agent", agentName, "error", err)
 		}
-		return exec.Command("false")
+		return "false", nil
 	}
 
 	base := m.tmuxBaseArgs(agent)
 	tmuxArgs := append(base[1:], args...)
 	if agent.UID > 0 {
 		suExecArgs := append([]string{m.agentExecUserSpec(agent), base[0]}, tmuxArgs...)
-		return exec.Command("su-exec", suExecArgs...)
+		return "su-exec", suExecArgs
 	}
-	return exec.Command(base[0], tmuxArgs...)
+	return base[0], tmuxArgs
 }
 
 func validateTmuxKillSessionArgs(args []string) error {
@@ -415,10 +438,27 @@ func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
 // consulted — SessionMissing's early returns exist precisely so it is not —
 // replace this and observe the calls.
 var tmuxSessionExists = func(m *Manager, agent *AgentProcess) bool {
-	cmd := m.tmuxCmd(agent, "has-session", "-t", agent.tmuxSession)
+	exists, _ := probeTmuxSession(context.Background(), m, agent)
+	return exists
+}
+
+// tmuxSessionProbe is the ctx-bounded has-session probe the watchdog's
+// Observe uses (#16097). Like tmuxSessionExists it is a function variable
+// solely as a TEST SEAM; production never assigns it.
+var tmuxSessionProbe = probeTmuxSession
+
+// probeTmuxSession runs `tmux has-session` under ctx. err is non-nil only when
+// ctx ended the probe (deadline or cancellation) — the session's existence is
+// then unknown, which callers must not read as "no session". Every other
+// failure keeps tmuxSessionExists's historical answer: false.
+func probeTmuxSession(ctx context.Context, m *Manager, agent *AgentProcess) (bool, error) {
+	cmd := m.tmuxCmdContext(ctx, agent, "has-session", "-t", agent.tmuxSession)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
-		return true
+		return true, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, fmt.Errorf("tmux has-session: %w", ctxErr)
 	}
 	stderr := strings.TrimSpace(string(output))
 	if tmuxStderrMeansNoSession(stderr) {
@@ -426,7 +466,7 @@ var tmuxSessionExists = func(m *Manager, agent *AgentProcess) bool {
 			m.logger.Debug("tmux has-session: no session",
 				"name", agent.Name, "session", agent.tmuxSession, "stderr", stderr)
 		}
-		return false
+		return false, nil
 	}
 	if m != nil && m.logger != nil && agent != nil {
 		m.logger.Warn("tmux has-session failed",
@@ -437,7 +477,7 @@ var tmuxSessionExists = func(m *Manager, agent *AgentProcess) bool {
 			"error", err,
 			"stderr", stderr)
 	}
-	return false
+	return false, nil
 }
 
 // tmuxStderrMeansNoSession reports whether has-session stderr is tmux's normal
@@ -497,21 +537,9 @@ func (m *Manager) waitForCLIReadyForAgent(agent *AgentProcess) bool {
 	}
 }
 
-func truncateHead(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "..."
-}
+func truncateHead(s string, n int) string { return textutil.Head(s, n) }
 
-func truncateTail(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return "..." + string(runes[len(runes)-n:])
-}
+func truncateTail(s string, n int) string { return textutil.Tail(s, n) }
 
 func (m *Manager) waitForInputPromptForAgent(agent *AgentProcess) bool {
 	return m.waitForInputPromptForAgentUnless(agent, nil)
@@ -544,12 +572,22 @@ func (m *Manager) CaptureFullLog(name string) (string, error) {
 	m.mu.RLock()
 	agent, ok := m.agents[name]
 	var target kickTranscriptTarget
+	var sandboxed bool
+	var logDir string
 	if ok {
 		target = m.kickTranscriptTargetLocked(agent)
+		sandboxed = m.agentSandboxEnabledLocked(agent)
+		logDir = m.agentKickLogDir(name)
 	}
 	m.mu.RUnlock()
 	if !ok {
 		return "", fmt.Errorf("agent %s not found", name)
+	}
+	// A sandboxed agent carries a session NAME like every agent but never a
+	// session: capturing it fails with "exit status 1", which the dashboard
+	// turned into a 404 on "full log" for every runtime: job agent.
+	if sandboxed {
+		return m.sandboxFullLog(name, logDir)
 	}
 	if agent.tmuxSession == "" {
 		return "", fmt.Errorf("agent %s has no active session", name)
@@ -560,9 +598,42 @@ func (m *Manager) CaptureFullLog(name string) (string, error) {
 	return content, err
 }
 
+// sandboxFullLog is CaptureFullLog for a sandboxed agent: there is no pane,
+// so the "full log" is the newest archived sandbox kick log — the container
+// or Job output hive collected when the last run ended. A sandboxed agent
+// with no run yet gets a message that says so rather than a pane error.
+func (m *Manager) sandboxFullLog(name, logDir string) (string, error) {
+	id, content, err := latestKickLog(logDir)
+	if err != nil {
+		return "", fmt.Errorf("agent %s: reading archived sandbox run log: %w", name, err)
+	}
+	if id == "" {
+		return "", fmt.Errorf("agent %s runs sandboxed and has no archived run yet; the log appears here when its first kick ends", name)
+	}
+	return content, nil
+}
+
 // captureVisiblePaneForAgent captures only the visible pane (no scrollback).
 func (m *Manager) captureVisiblePaneForAgent(agent *AgentProcess) string {
 	return m.terminalSession().CaptureVisiblePane(agent)
+}
+
+// visiblePaneContextCapturer is implemented by terminals that can bound a
+// visible-pane capture with a context. It is a separate, optional interface so
+// the exported TerminalSession stays unchanged.
+type visiblePaneContextCapturer interface {
+	CaptureVisiblePaneContext(ctx context.Context, agent *AgentProcess) (string, error)
+}
+
+// captureVisiblePaneForAgentContext is captureVisiblePaneForAgent bounded by
+// ctx where the terminal supports it. err is non-nil only when ctx ended the
+// capture; other failures yield "" exactly like the unbounded capture.
+func (m *Manager) captureVisiblePaneForAgentContext(ctx context.Context, agent *AgentProcess) (string, error) {
+	term := m.terminalSession()
+	if c, ok := term.(visiblePaneContextCapturer); ok {
+		return c.CaptureVisiblePaneContext(ctx, agent)
+	}
+	return term.CaptureVisiblePane(agent), nil
 }
 
 func (m *Manager) tmuxSessionHasAttachedClientForAgent(agent *AgentProcess) bool {
@@ -640,4 +711,42 @@ const attachedClientIdleGrace = 30 * time.Minute
 
 func (t tmuxTerminal) SleepDuringPromptDismiss(d time.Duration) {
 	time.Sleep(d)
+}
+
+// SessionMissing reports whether an agent the manager believes is RUNNING has
+// no live tmux session — the zombie case, where in-memory state and reality
+// have diverged.
+//
+// It is deliberately false for any agent that is not StateRunning: a paused,
+// stopped or never-started agent legitimately has no session, and reporting
+// those as missing would turn every deliberate pause into a fault.
+//
+// The session check must go through the agent's OWN tmux socket. Each agent
+// runs under its own UID on its own socket (e.g. /tmp/tmux-2007/hive-scanner),
+// so a query against the default socket answers "no server running" even when
+// every session is alive — the exact false reading that has sent live
+// diagnosis down the wrong path.
+func (m *Manager) SessionMissing(name string) bool {
+	m.mu.RLock()
+	agent, ok := m.agents[name]
+	if !ok || agent.State != StateRunning || agent.Paused {
+		m.mu.RUnlock()
+		return false
+	}
+	m.mu.RUnlock()
+	// The exec runs outside the lock: it shells out to tmux, and holding a
+	// manager lock across a subprocess is how the startup path has deadlocked
+	// before.
+	return !m.tmuxSessionExistsForAgent(agent)
+}
+
+func (m *Manager) TmuxSession(name string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	agent, ok := m.agents[name]
+	if !ok {
+		return ""
+	}
+	return agent.tmuxSession
 }

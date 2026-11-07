@@ -26,6 +26,9 @@ type ProjectContext struct {
 	// MCP server authors PRs/commits as the App bot. Default false → no token is
 	// injected and behavior is unchanged (opt-in per hive).
 	AppAuthoredPRs bool
+	// SharedUIDReadToken permits read-only App caches without dedicated UIDs.
+	// Cross-agent read isolation is unavailable in this explicit opt-in mode.
+	SharedUIDReadToken bool
 	// AppBotLogin and AppBotUserID identify the installed GitHub App's bot
 	// account. When AppAuthoredPRs is on, push-capable agents use this bot's
 	// noreply address ("<user id>+<login>@users.noreply.github.com") for git
@@ -40,6 +43,14 @@ type ProjectContext struct {
 	// default-off; bob launch commands remain byte-identical unless it or a
 	// per-agent bob.session_label is configured.
 	BobSessionPrefix string
+	// InferenceDefaultModel returns the model an inference-routed agent on
+	// backend launches with when its own config names none — the
+	// default_model of whichever gateway / governor.litellm block supplies its
+	// endpoint (config.AgentRuntimeGovernorConfig.DefaultInferenceModel). A
+	// live function off the config pointer so a default saved in the dashboard
+	// reaches the next launch without a restart. Nil means no fallback: the
+	// launch omits --model and the backend's own default applies.
+	InferenceDefaultModel func(backend string) string
 	// RepoPaused reports whether a repo carries an operator pause (#6203). It is
 	// a live predicate rather than a snapshot list because ProjectContext is
 	// built once at boot and a pause is taken mid-run — a repo frozen for a

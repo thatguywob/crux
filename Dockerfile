@@ -8,12 +8,12 @@ FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
 ARG TARGETOS TARGETARCH VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN for i in 1 2 3; do go mod download && break; [ "$i" = 3 ] && exit 1; sleep $((i * 2)); done
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/crux ./cmd/crux
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache tmux ca-certificates git openssh-client bash \
  && adduser -D -u 1000 crux
 COPY --from=build /out/crux /usr/local/bin/crux

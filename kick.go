@@ -1,6 +1,13 @@
 package crux
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrAgentBusy means no kick was delivered because an agent is mid-turn.
+// Callers should defer the kick without recording a delivery failure.
+var ErrAgentBusy = errors.New("agent turn in progress")
 
 // Kick dispatch phases. A dispatch is INDETERMINATE while it is pending: the
 // prompt may still be delivered. Only KickPhaseFailed is a definitive failure.
@@ -29,7 +36,7 @@ type KickDispatch struct {
 	QueuedAt time.Time `json:"queuedAt"`
 	// SettledAt is when the dispatch reached a terminal phase. Zero while
 	// pending.
-	SettledAt time.Time `json:"settledAt,omitempty"`
+	SettledAt time.Time `json:"settledAt,omitzero"`
 }
 
 // Pending reports whether this dispatch is still in flight — the state in

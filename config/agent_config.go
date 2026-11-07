@@ -34,9 +34,14 @@ type SandboxJobConfig struct {
 	Tolerations         []SandboxJobToleration `yaml:"tolerations,omitempty" json:"tolerations,omitempty"`
 	Resources           SandboxJobResources    `yaml:"resources,omitempty" json:"resources,omitempty"`
 	ServiceAccount      string                 `yaml:"service_account,omitempty" json:"service_account,omitempty"`
-	EnvFromSecrets      []string               `yaml:"env_from_secrets,omitempty" json:"env_from_secrets,omitempty"`
-	Volumes             []SandboxJobVolume     `yaml:"volumes,omitempty" json:"volumes,omitempty"`
-	TTLSeconds          int                    `yaml:"ttl_seconds,omitempty" json:"ttl_seconds,omitempty"`
+	// SchedulerName sets the pod's schedulerName. Accelerator clusters often
+	// gate device-requesting pods behind a custom scheduler via an admission
+	// webhook (e.g. `A pod must use "schedulerName: spyre-scheduler"`);
+	// without this the Job create is denied before any pod exists.
+	SchedulerName  string             `yaml:"scheduler_name,omitempty" json:"scheduler_name,omitempty"`
+	EnvFromSecrets []string           `yaml:"env_from_secrets,omitempty" json:"env_from_secrets,omitempty"`
+	Volumes        []SandboxJobVolume `yaml:"volumes,omitempty" json:"volumes,omitempty"`
+	TTLSeconds     int                `yaml:"ttl_seconds,omitempty" json:"ttl_seconds,omitempty"`
 }
 
 // SandboxJobToleration mirrors the subset of a Kubernetes toleration an
@@ -126,6 +131,10 @@ type AgentRuntimeConfig struct {
 	// (the default cap). Exported because the Config YAML hooks in
 	// pkg/config set and read it; `yaml:"-"` keeps it off the wire.
 	AgentsGitHubAPIHourlyCapSet bool `yaml:"-" json:"-"`
+	// AgentsSessionRecycle is the fleet default for the CLI session RSS/age
+	// recycle policy (#14842). It is encoded under agents.session_recycle by
+	// Config's YAML hooks, like AgentsGitHubAPIHourlyCap.
+	AgentsSessionRecycle SessionRecycleConfig `yaml:"-" json:"-"`
 	// Backends is the spoke-wide backend allow/deny list (#11310), enforced
 	// at pack apply and by PUT /api/config/agent/{name}/models.
 	Backends BackendsConfig `yaml:"backends,omitempty" json:"backends,omitempty"`
@@ -308,8 +317,13 @@ type AgentConfig struct {
 	// turn. 0 disables it; exceeding it raises busy-over-ceiling but never
 	// interrupts the agent.
 	MaxTurnDuration time.Duration `yaml:"max_turn_duration,omitempty" json:"max_turn_duration,omitempty"`
-	DisplayName     string        `yaml:"display_name" json:"display_name,omitempty"`
-	Description     string        `yaml:"description" json:"description,omitempty"`
+	// SessionRecycle overrides the fleet agents.session_recycle policy for
+	// this agent (#14842). Nil inherits the fleet value; EnabledAgents()
+	// stamps the fleet block into nil pointers so the agent manager sees one
+	// resolved policy per agent.
+	SessionRecycle *SessionRecycleConfig `yaml:"session_recycle,omitempty" json:"session_recycle,omitempty"`
+	DisplayName    string                `yaml:"display_name" json:"display_name,omitempty"`
+	Description    string                `yaml:"description" json:"description,omitempty"`
 	// Bob holds bob-backend-only per-agent options. Empty is default-off.
 	Bob AgentBobConfig `yaml:"bob,omitempty" json:"bob,omitempty"`
 	// BobDisplayName is the legacy flat spelling for Bob.SessionLabel. It is
@@ -474,7 +488,34 @@ type AgentSandboxConfig struct {
 	WorkspaceDir string            `yaml:"workspace_dir,omitempty" json:"workspace_dir,omitempty"`
 	Runtime      string            `yaml:"runtime,omitempty" json:"runtime,omitempty"`
 	Job          *SandboxJobConfig `yaml:"job,omitempty" json:"job,omitempty"`
+	// Publish gates what a sandboxed run may publish; see SandboxPublishConfig.
+	Publish *SandboxPublishConfig `yaml:"publish,omitempty" json:"publish,omitempty"`
 }
+
+// SandboxPublishConfig is the deterministic preflight hive runs before it
+// pushes a sandboxed run's commits and opens a PR. The agent's own report is
+// necessary but trusts the agent; these commands do not. Each entry is run
+// with `sh -lc` in a fresh container/Job of the same image, workspace and
+// env allowlist as the agent's run, with HIVE_CHANGED_FILES and
+// HIVE_CHANGED_TESTS exported (newline-separated paths from the run's
+// commits). A non-zero exit from any command withholds the push and the PR
+// and puts the command's output tail on the agent card.
+//
+// This config is the only source of verify commands. A
+// `<!-- hive:publish.verify … -->` block in a kick message is recognised and
+// logged but never run: the rendered message carries issue and PR titles and
+// other text the hive did not write.
+type SandboxPublishConfig struct {
+	Verify []string `yaml:"verify,omitempty" json:"verify,omitempty"`
+	// VerifyTimeoutS bounds each verify command. Non-positive uses the
+	// executor default (DefaultSandboxVerifyTimeoutS).
+	VerifyTimeoutS int `yaml:"verify_timeout_s,omitempty" json:"verify_timeout_s,omitempty"`
+}
+
+// DefaultSandboxVerifyTimeoutS bounds one publish.verify command when no
+// timeout is configured: long enough for a dependency-heavy collect-only or a
+// single test file, short enough that a hung verify cannot pin the agent.
+const DefaultSandboxVerifyTimeoutS = 900
 
 // AgentSandboxOverride is the per-agent sandbox opt-in block.
 type AgentSandboxOverride struct {
@@ -485,6 +526,9 @@ type AgentSandboxOverride struct {
 	TimeoutS     int               `yaml:"timeout_s,omitempty" json:"timeout_s,omitempty"`
 	Runtime      string            `yaml:"runtime,omitempty" json:"runtime,omitempty"`
 	Job          *SandboxJobConfig `yaml:"job,omitempty" json:"job,omitempty"`
+	// Publish, when set, replaces the global publish preflight for this
+	// agent; an empty verify list here turns the preflight off for it.
+	Publish *SandboxPublishConfig `yaml:"publish,omitempty" json:"publish,omitempty"`
 }
 
 // BobConfig configures the IBM bobshell ("bob") CLI backend. Only the

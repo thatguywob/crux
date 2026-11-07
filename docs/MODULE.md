@@ -1,4 +1,4 @@
-<!-- Synced from hivecommons/hive src/crux/README.md at a7fabffe1a05a29f3a15ca3762dacbf0607fc7a7; edit it there. -->
+<!-- Synced from hivecommons/hive src/crux/README.md at e8347bd5e13d363223f5c0c23501695fb497fa9a; edit it there. -->
 
 # Crux
 
@@ -11,8 +11,10 @@ its own: this directory is the Go module `github.com/hivecommons/crux`
 and depends on nothing else in the Hive repository.
 
 The design, the boundary rules and the roadmap are in
-[`src/docs/design/crux.md`](../docs/design/crux.md); the operator pages are
-[`crux-cli.md`](../docs/crux-cli.md) and [`crux-serve.md`](../docs/crux-serve.md).
+[`src/docs/design/crux.md`](https://github.com/hivecommons/hive/blob/e8347bd5e13d363223f5c0c23501695fb497fa9a/src/docs/design/crux.md); the operator pages are
+[`crux-cli.md`](https://github.com/hivecommons/hive/blob/e8347bd5e13d363223f5c0c23501695fb497fa9a/src/docs/crux-cli.md) and [`crux-serve.md`](https://github.com/hivecommons/hive/blob/e8347bd5e13d363223f5c0c23501695fb497fa9a/src/docs/crux-serve.md).
+Forge-neutral durable event/work lanes are described in
+[`crux-lanes.md`](https://github.com/hivecommons/hive/blob/e8347bd5e13d363223f5c0c23501695fb497fa9a/src/docs/crux-lanes.md).
 
 ## What is in the module
 
@@ -24,7 +26,9 @@ The design, the boundary rules and the roadmap are in
 | `crux/cli` | the `crux` command: `run`, `ps`, `logs`, `kick`, `stop`, `serve`, `agy-turn` (the pane-side agy subprocess), and `--server` remote mode |
 | `crux/api`, `crux/serve` | the wire contract of `crux serve` (stdlib-only client and types, `api.RuntimeRoutes`: every `crux.Runtime` method → route) and the server |
 | `crux/api/client` | `client.Runtime`: `crux.Runtime` over the API; what `crux/runtime.New` returns for `CRUX_MODE=sidecar` |
-| `crux/api/callback`, `crux/hivecap` | the hive callback contract (capabilities hive serves the runtime: scoped tokens, PRs, Linear, scanners, conditions) and the runtime-side adapters `crux serve --hive-callback` installs |
+| `crux/lanes` | opt-in JetStream durable lanes: neutral project ACLs, event replay, claimable delivery groups and fenced receipts; Hive is an ordinary participant |
+| `crux/api/callback`, `crux/hivecap` | the hive callback contract (capabilities hive serves the runtime: scoped tokens, agent mint, Bob credential, PRs, Linear, scanners, conditions, host policy, inference routes, effects, usage) and the runtime-side adapters `crux serve --hive-callback` installs; `api.HostSetters` is the table that accounts for every `crux.Host` setter (route / callback / config key / in-process-only) |
+| `crux/runtime` | `runtime.New` (mode selection: `CRUX_MODE=inprocess` default, `sidecar`) and `runtime.Supervisor`, the child supervisor hive uses for `crux serve` when `CRUX_SUPERVISE=child` |
 | `crux/defs` | the file-based agent-definition loader the module's binary uses |
 | `crux/cmd/crux` | the binary |
 | the rest | observation and policy: `watchdog`, `trajectory`, `logscrub`, `proxy`, `sandbox`, `inference`, … |
@@ -77,7 +81,7 @@ export CRUX_DEFS=./defs            # or --defs ./defs on every command; a single
 crux run scout                     # start scout, stream its output, stop it on Ctrl-C
 crux run --detach scout            # start it and return
 crux ps                            # what is running
-crux logs scout -n 50              # its recent pane output (--buffer, --full, --json)
+crux logs -n 50 scout              # its recent pane output (--buffer, --full, --json)
 crux kick scout "look at issue 42" # send it work
 crux stop scout
 crux run ./defs/scout.yaml         # a definition file can be named directly
@@ -100,7 +104,7 @@ crux serve --listen 127.0.0.1:7777 --token "$T" # TCP too; loopback only, token 
 agents, run from a definition, logs (pane, buffer, full, or followed as
 server-sent events), kick, stop, health, and an event stream of starts,
 stops, kicks and state changes. The contract is `crux/api`, which also has
-a Go client (`api.NewClient`). [`crux-serve.md`](../docs/crux-serve.md)
+a Go client (`api.NewClient`). [`crux-serve.md`](https://github.com/hivecommons/hive/blob/e8347bd5e13d363223f5c0c23501695fb497fa9a/src/docs/crux-serve.md)
 has the routes.
 
 ## Remote mode
@@ -118,6 +122,17 @@ crux logs -f scout                       # follows over SSE
 
 `crux --version` prints the version embedded at build time
 (`-ldflags "-X main.version=…"`, `dev` otherwise).
+
+## Telemetry
+
+The runtime records OpenTelemetry spans (`agent.send_kick`, …) and two kick
+metrics through the OTel API. The `crux` binary exports them over OTLP/HTTP
+only when the standard `OTEL_EXPORTER_OTLP_ENDPOINT` (or a per-signal
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`)
+is set; with none set nothing is installed and nothing is sent. There is no
+`/metrics` endpoint: point crux at an OpenTelemetry Collector and export from
+there. Variables and instruments are listed in
+[`crux-cli.md`](https://github.com/hivecommons/hive/blob/e8347bd5e13d363223f5c0c23501695fb497fa9a/src/docs/crux-cli.md#telemetry).
 
 ## Using Crux from Go
 

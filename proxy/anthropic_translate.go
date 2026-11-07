@@ -3,11 +3,17 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 )
+
+// errNoInferenceModel is the translator's refusal when neither the agent nor
+// the gateway names a model: an operator configuration condition, not a
+// provider failure (hivecommons/hive#16170).
+var errNoInferenceModel = errors.New("no inference model configured: select an agent model or set the gateway default_model in Model Gateways")
 
 // translateAnthropicToOpenAI converts an Anthropic Messages API request body
 // into an OpenAI Chat Completions API request body, overriding the model.
@@ -16,6 +22,11 @@ import (
 // open-source models toward agentic tool-calling behaviour. Pass "" to
 // leave the system prompt unchanged (used by tests and non-inference paths).
 func translateAnthropicToOpenAI(body []byte, targetModel string, maxContextLen int, preamble string) ([]byte, error) {
+	// The CLI's model is a Claude alias, not necessarily a gateway model ID.
+	// Never use it as a fallback or send an empty model to the provider.
+	if strings.TrimSpace(targetModel) == "" {
+		return nil, errNoInferenceModel
+	}
 	var req anthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("unmarshal anthropic request: %w", err)

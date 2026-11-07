@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/hivecommons/crux"
@@ -40,14 +41,17 @@ const (
 const copilotQuestionFormMessage = "Copilot CLI asked the user a question; no human is attached — dismissed with Escape so the kick can be delivered"
 
 type transcriptActivityScan struct {
-	name string
-	uid  int
+	name   string
+	uid    int
+	target kickTranscriptTarget
 }
 
 type transcriptActivityResult struct {
-	name string
-	at   time.Time
-	ok   bool
+	name     string
+	at       time.Time
+	ok       bool
+	codeWork *crux.CodeWork
+	since    time.Time
 }
 
 // transcriptSessionCache remembers, per agent, the events.jsonl mtime last
@@ -323,27 +327,54 @@ func (m *Manager) pendingTranscriptActivityScansLocked(now time.Time) []transcri
 		if !agent.lastTranscriptScanAt.IsZero() && now.Sub(agent.lastTranscriptScanAt) < transcriptLivenessScanInterval {
 			continue
 		}
-		scans = append(scans, transcriptActivityScan{name: agent.Name, uid: agent.UID})
+		scans = append(scans, transcriptActivityScan{name: agent.Name, uid: agent.UID, target: m.kickTranscriptTargetLocked(agent)})
 	}
 	return scans
 }
 
-// scanTranscriptActivity stats each agent's sessions. caches is keyed by
-// agent name and may be nil (every session is stat'd).
+// transcriptScanConcurrency bounds how many agents' session trees are walked
+// at once. Each walk is dominated by network-filesystem round trips, so a few
+// in parallel bring a many-agent pass back inside the scan interval without
+// flooding the mount.
+const transcriptScanConcurrency = 4
+
+// scanAgentTranscript walks one agent's session tree; a variable so tests can
+// observe how the passes are scheduled.
+var scanAgentTranscript = func(scan transcriptActivityScan, cache *transcriptSessionCache, now time.Time) (time.Time, bool) {
+	return newestCopilotTranscriptActivityCached(AgentHome(scan.name, scan.uid, "copilot"), cache, now)
+}
+
+// scanTranscriptActivity stats each agent's sessions, up to
+// transcriptScanConcurrency agents at a time. caches is keyed by agent name
+// and may be nil (every session is stat'd). Results keep the order of scans.
 func scanTranscriptActivity(scans []transcriptActivityScan, caches map[string]*transcriptSessionCache, now time.Time) []transcriptActivityResult {
-	results := make([]transcriptActivityResult, 0, len(scans))
-	for _, scan := range scans {
-		var cache *transcriptSessionCache
+	results := make([]transcriptActivityResult, len(scans))
+	perAgent := make([]*transcriptSessionCache, len(scans))
+	for i, scan := range scans {
 		if caches != nil {
-			cache = caches[scan.name]
+			cache := caches[scan.name]
 			if cache == nil {
 				cache = &transcriptSessionCache{}
 				caches[scan.name] = cache
 			}
+			perAgent[i] = cache
 		}
-		at, ok := newestCopilotTranscriptActivityCached(AgentHome(scan.name, scan.uid, "copilot"), cache, now)
-		results = append(results, transcriptActivityResult{name: scan.name, at: at, ok: ok})
 	}
+	sem := make(chan struct{}, transcriptScanConcurrency)
+	var wg sync.WaitGroup
+	for i, scan := range scans {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			at, ok := scanAgentTranscript(scan, perAgent[i], now)
+			results[i] = transcriptActivityResult{name: scan.name, at: at, ok: ok}
+			results[i].codeWork = scanCodeWork(scan.target, perAgent[i], now)
+			results[i].since = scan.target.since
+		}()
+	}
+	wg.Wait()
 	return results
 }
 
@@ -358,6 +389,9 @@ func (m *Manager) applyTranscriptActivityResultsLocked(results []transcriptActiv
 		agent.lastTranscriptScanAt = scannedAt
 		if result.ok {
 			agent.LastTranscriptActivity = result.at
+		}
+		if agent.LastKick != nil && agent.LastKick.Equal(result.since) {
+			agent.CodeWork = cloneCodeWork(result.codeWork)
 		}
 	}
 }
@@ -381,14 +415,14 @@ func (m *Manager) StartTranscriptActivityRefresh(ctx context.Context) {
 // tick; scans never overlap because they run on this goroutine alone.
 func (m *Manager) runTranscriptActivityRefresh(ctx context.Context, ticks <-chan time.Time, now func() time.Time) {
 	caches := map[string]*transcriptSessionCache{}
-	slow := false
-	m.refreshTranscriptActivity(caches, now, &slow)
+	pace := &transcriptScanPace{}
+	m.refreshTranscriptActivity(caches, now, pace)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticks:
-			m.refreshTranscriptActivity(caches, now, &slow)
+			m.refreshTranscriptActivity(caches, now, pace)
 		}
 	}
 }
@@ -396,9 +430,9 @@ func (m *Manager) runTranscriptActivityRefresh(ctx context.Context, ticks <-chan
 // refreshTranscriptActivity runs one scan pass: pick the stale agents under
 // a short read lock, stat their sessions with no lock held, then publish
 // the results under a short write lock. Returns how many agents were
-// scanned. slow tracks the previous pass's verdict so a walk that outlives
-// the scan interval is logged on the transition, not every tick.
-func (m *Manager) refreshTranscriptActivity(caches map[string]*transcriptSessionCache, now func() time.Time, slow *bool) int {
+// scanned. pace debounces the overrun warning: it fires once after
+// several consecutive slow passes, and re-arms only after a clearly fast one.
+func (m *Manager) refreshTranscriptActivity(caches map[string]*transcriptSessionCache, now func() time.Time, pace *transcriptScanPace) int {
 	started := now()
 	m.mu.RLock()
 	scans := m.pendingTranscriptActivityScansLocked(started)
@@ -419,16 +453,10 @@ func (m *Manager) refreshTranscriptActivity(caches map[string]*transcriptSession
 			delete(caches, name)
 		}
 	}
-	if took := now().Sub(started); took > transcriptLivenessScanInterval {
-		if slow != nil && !*slow && m.logger != nil {
-			m.logger.Warn("copilot transcript activity scan outlived its interval; agent liveness reads may lag",
-				"took", took.Round(time.Millisecond).String(), "agents", len(scans), "interval", transcriptLivenessScanInterval.String())
-		}
-		if slow != nil {
-			*slow = true
-		}
-	} else if slow != nil {
-		*slow = false
+	took := now().Sub(started)
+	if pace != nil && pace.observe(took, transcriptLivenessScanInterval) && m.logger != nil {
+		m.logger.Warn("copilot transcript activity scan outlived its interval; agent liveness reads may lag",
+			"took", took.Round(time.Millisecond).String(), "agents", len(scans), "interval", transcriptLivenessScanInterval.String())
 	}
 	return len(results)
 }
@@ -538,4 +566,13 @@ func formatTimeForLog(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// kickNotReadyErrorLocked distinguishes a live turn from a stalled CLI.
+// Caller holds m.mu. Keep the original diagnostic for genuine failures.
+func (m *Manager) kickNotReadyErrorLocked(agent *AgentProcess, now time.Time, err error) error {
+	if _, live := kickUndeliverableTranscriptLiveness(agent, now); live {
+		return fmt.Errorf("%w: %v", crux.ErrAgentBusy, err)
+	}
+	return err
 }

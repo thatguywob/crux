@@ -146,7 +146,7 @@ type KickDispatch struct {
 	Phase     string    `json:"phase"`
 	Error     string    `json:"error,omitempty"`
 	QueuedAt  time.Time `json:"queuedAt"`
-	SettledAt time.Time `json:"settledAt,omitempty"`
+	SettledAt time.Time `json:"settledAt,omitzero"`
 }
 
 // KickDispatchResponse is the body of GET /v1/agents/{name}/kick
@@ -825,7 +825,7 @@ var HostSetters = map[string]HostSetter{
 	"SetSandboxAuditCallback":    {HostSetterEvent, EventSandboxAudit},
 	"SetAuditSink":               {HostSetterEvent, EventAudit},
 	"SetConditionReporter":       {HostSetterEvent, EventCondition + ", " + hostViaConditions},
-
 	// In-process only.
-	"SetSpanStarter": {HostSetterInProcessOnly, "OpenTelemetry global tracer in the runtime process; trajectory events are independent of spans"},
+	"SetSpanStarter":      {HostSetterInProcessOnly, "OpenTelemetry global tracer in the runtime process; trajectory events are independent of spans"},
+	"SetKnowledgeAdviser": {HostSetterInProcessOnly, "the knowledge store lives in the hive process; a sidecar runtime runs without the mid-task knowledge advisor (hivecommons/hive#17052 phase 1)"},
 }

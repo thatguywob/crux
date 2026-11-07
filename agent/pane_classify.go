@@ -529,6 +529,32 @@ func paneShowsQuotaExhausted(lines []string) bool {
 	return false
 }
 
+// approvalDeniedPrefix is the stable Copilot CLI text for a tool request the
+// assisted-approval judge refused in a non-interactive run; the judge's
+// explanation follows "Feedback:" and is fed back to the model.
+const approvalDeniedPrefix = "permission denied because the assisted approval check did not approve this request"
+
+// paneShowsApprovalDenied reports a Copilot assisted-approval denial and the
+// judge's feedback (empty when the pane wraps it off the tail). The approved
+// form ("Assisted Permissions approved") never matches.
+func paneShowsApprovalDenied(lines []string) (feedback string, ok bool) {
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		if !strings.Contains(lower, approvalDeniedPrefix) && !strings.Contains(lower, "assisted permissions declined") {
+			continue
+		}
+		ok = true
+		for j := i; j < len(lines) && j <= i+4; j++ {
+			if _, after, found := strings.Cut(lines[j], "Feedback:"); found {
+				feedback = strings.TrimSpace(after)
+				break
+			}
+		}
+		return feedback, ok
+	}
+	return "", false
+}
+
 func paneShowsBobAPIKeyRejected(lines []string) bool {
 	for _, line := range lines {
 		lower := strings.ToLower(line)
@@ -593,11 +619,11 @@ func paneShowsLoginPrompt(lines []string) bool {
 		if lineShowsUpstreamAuthorizationError(line) || paneShowsQuotaExhausted([]string{line}) {
 			continue
 		}
-		if lineHasLoginDirective(line) {
+		if lineHasLoginDirective(line) && !authHitIsSourceText(line, "/login") {
 			return true
 		}
 		for _, pat := range loginPromptPatterns {
-			if strings.Contains(line, pat) {
+			if strings.Contains(line, pat) && !authHitIsSourceText(line, pat) {
 				return true
 			}
 		}

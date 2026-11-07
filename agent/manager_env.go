@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,28 @@ import (
 	"github.com/hivecommons/crux/gitidentity"
 	"github.com/hivecommons/crux/jev"
 )
+
+// agentNoProxy returns the NO_PROXY value handed to agents: loopback plus the
+// host of OMP_AUTH_BROKER_URL, and only that host. An unset, unparsable or
+// host-less URL adds nothing, so every other private address stays behind the
+// proxy's destination guard. The host is appended only when it is an IP
+// literal or a plain DNS hostname: wildcards, leading or trailing dots and
+// any other odd characters fall back to loopback, since NO_PROXY would read
+// them as "bypass everything" or a domain-suffix match.
+var noProxyHostRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`)
+
+func agentNoProxy() string {
+	const loopback = "127.0.0.1,localhost,::1"
+	u, err := url.Parse(strings.TrimSpace(os.Getenv("OMP_AUTH_BROKER_URL")))
+	if err != nil {
+		return loopback
+	}
+	host := u.Hostname()
+	if net.ParseIP(host) == nil && !noProxyHostRe.MatchString(host) {
+		return loopback
+	}
+	return loopback + "," + host
+}
 
 func (m *Manager) buildBootstrapPrompt(agent *AgentProcess) string {
 	// No boot prompt — the governor's first eval cycle (10s after startup)
@@ -223,6 +247,13 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 		{"HIVE_BACKEND", backend, false},
 		{"HIVE_MODEL", model, false},
 	}
+	if backend == "cline" {
+		source := os.Getenv("HIVE_CLINE_CONFIG_DIR")
+		if source == "" {
+			source = filepath.Join(sharedAgentHome, ".cline")
+		}
+		vars = append(vars, agentEnvPair{"HIVE_CLINE_CONFIG_DIR", source, false})
+	}
 	if hiveID := os.Getenv("HIVE_ID"); hiveID != "" {
 		vars = append(vars, agentEnvPair{"HIVE_ID", hiveID, false})
 	}
@@ -253,7 +284,10 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 	vars = append(vars, agentEnvPair{"HTTP_PROXY", proxyURL, false})
 	// Loopback must never traverse the hive proxy for any backend: an agent
 	// polling a local dev server would otherwise get proxy-side dial errors (#14076).
-	vars = append(vars, agentEnvPair{"NO_PROXY", "127.0.0.1,localhost,::1", false})
+	// The credential broker (OMP_AUTH_BROKER_URL) usually sits on a private
+	// address the proxy's plain-forward guard refuses, so its host bypasses
+	// the proxy too (#15432).
+	vars = append(vars, agentEnvPair{"NO_PROXY", agentNoProxy(), false})
 	vars = append(vars, agentEnvPair{"HIVE_PROXY_AGENT", agent.Name, false})
 	vars = append(vars, agentEnvPair{"GIT_TERMINAL_PROMPT", "0", false})
 	vars = append(vars, agentEnvPair{"NODE_EXTRA_CA_CERTS", proxyCACertPath, false})
@@ -442,7 +476,7 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 	vars = append(vars, agentEnvPair{config.ExplainModeEnvVar, resolveExplainMode(agent.Config, m.explainModeDefault()), false})
 	// GIT_SSL_CAINFO only — NOT SSL_CERT_FILE (that breaks Copilot API TLS)
 	vars = append(vars, agentEnvPair{"GIT_SSL_CAINFO", proxyCACertPath, false})
-	if agent.UID > 0 {
+	if m.agentTokenCacheEnabled(agent) {
 		vars = append(vars, agentEnvPair{"HIVE_AGENT_TOKEN_CACHE", crux.AgentTokenCachePath(crux.DefaultAgentTokenCacheDir, agent.Name), false})
 	}
 	if agent.UID > 0 {

@@ -344,7 +344,7 @@ func TestCollectAgentReport_FindsPrefixedReportFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(valid), 0o660); err != nil {
 		t.Fatal(err)
 	}
-	gotPath, report := collectAgentReport(ws)
+	gotPath, report, _ := collectAgentReport(ws)
 	if gotPath != path {
 		t.Errorf("report path = %q, want %q", gotPath, path)
 	}
@@ -364,7 +364,7 @@ func TestCollectAgentReport_InvalidSchemaStillReturnsPath(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "agent-report.json"), []byte(`{"unexpected":"shape"}`), 0o660); err != nil {
 		t.Fatal(err)
 	}
-	gotPath, report := collectAgentReport(ws)
+	gotPath, report, _ := collectAgentReport(ws)
 	if gotPath == "" {
 		t.Error("path must be surfaced for a JSON report that fails schema validation")
 	}
@@ -374,7 +374,7 @@ func TestCollectAgentReport_InvalidSchemaStillReturnsPath(t *testing.T) {
 }
 
 func TestCollectAgentReport_NothingFound(t *testing.T) {
-	gotPath, report := collectAgentReport(t.TempDir())
+	gotPath, report, _ := collectAgentReport(t.TempDir())
 	if gotPath != "" || report != nil {
 		t.Errorf("empty workspace: got (%q, %+v), want (\"\", nil)", gotPath, report)
 	}
@@ -402,6 +402,19 @@ func TestSandboxExecutorZeroValueAccessors(t *testing.T) {
 	}
 	if got := e.branchName("My Agent"); got != "hive/my-agent/20260817000000" {
 		t.Errorf("branchName = %q, want deterministic timestamped branch", got)
+	}
+}
+
+// The production runner feeds the push broker, whose normaliser commits
+// `git show` output as file content, so exit-0 stderr must stay out of a
+// successful result exactly as pushbroker.ExecRunner guarantees.
+func TestSandboxExecRunnerDropsStderrOnSuccess(t *testing.T) {
+	out, err := sandboxExecRunner{}.Run(context.Background(), t.TempDir(), []string{"PATH=" + os.Getenv("PATH")}, "sh", "-c", "echo noise >&2; printf data")
+	if err != nil {
+		t.Fatalf("exec runner: %v", err)
+	}
+	if string(out) != "data" {
+		t.Errorf("successful output = %q, want stdout only", out)
 	}
 }
 

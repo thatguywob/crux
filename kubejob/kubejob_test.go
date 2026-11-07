@@ -24,18 +24,21 @@ import (
 // was sent, serves a scripted sequence of Job statuses, one pod, its log and
 // its terminated exit code, and records deletes.
 type fakeAPI struct {
-	mu        sync.Mutex
-	created   map[string]any
-	statuses  []string // JSON bodies served to successive GET job calls
-	getCalls  int
-	deleted   bool
-	podName   string
-	exitCode  int
-	noPod     bool
-	logBody   string
-	podStatus string // "terminated" or "running"
-	failCode  int    // when >0, every request fails with this status
-	createErr int    // when >0, POST fails with this status
+	mu                    sync.Mutex
+	created               map[string]any
+	statuses              []string // JSON bodies served to successive GET job calls
+	getCalls              int
+	deleted               bool
+	podName               string
+	exitCode              int
+	noPod                 bool
+	logBody               string
+	podStatus             string // "terminated" or "running"
+	failCode              int    // when >0, every request fails with this status
+	createErr             int    // when >0, POST fails with this status
+	onJobGet              func() // called (under mu) on every GET job, after it is counted
+	onPodLogAfterComplete func() // called (under mu) on pod log request after Job Complete
+	jobCompleted          bool   // tracks whether job status shows Complete
 }
 
 func newFakeAPI() *fakeAPI {
@@ -72,7 +75,14 @@ func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
 				i = len(f.statuses) - 1
 			}
 			f.getCalls++
-			_, _ = w.Write([]byte(f.statuses[i]))
+			statusBody := f.statuses[i]
+			if strings.Contains(statusBody, `"type":"Complete"`) {
+				f.jobCompleted = true
+			}
+			if f.onJobGet != nil {
+				f.onJobGet()
+			}
+			_, _ = w.Write([]byte(statusBody))
 		case r.Method == http.MethodDelete:
 			f.deleted = true
 			_, _ = w.Write([]byte(`{"kind":"Status","status":"Success"}`))
@@ -83,6 +93,9 @@ func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
 			}
 			_, _ = w.Write([]byte(`{"items":[{"metadata":{"name":"` + f.podName + `"}}]}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/log"):
+			if f.jobCompleted && f.onPodLogAfterComplete != nil {
+				f.onPodLogAfterComplete()
+			}
 			_, _ = w.Write([]byte(f.logBody))
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pods/"):
 			state := `{"terminated":{"exitCode":` + itoa(f.exitCode) + `}}`
@@ -186,11 +199,14 @@ func TestRunContextTimeoutDeletesTheJob(t *testing.T) {
 	defer srv.Close()
 	l := newLauncher(srv, Options{})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	// End the context only once Run is polling the created Job, so a slow
+	// runner cannot expire it before the Job exists.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	api.onJobGet = cancel
 	res, err := l.Run(ctx, specFor("/data/agents/sandbox/deps-123"))
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run error = %v, want deadline exceeded", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want the ended context", err)
 	}
 	if !api.deleted {
 		t.Error("a timed-out Job must be deleted so the workload stops")
@@ -203,7 +219,7 @@ func TestRunContextTimeoutDeletesTheJob(t *testing.T) {
 	}
 }
 
-func TestRunCompleteWithNoPodStillSucceeds(t *testing.T) {
+func TestRunCompleteWithNoPodKeepsExitCodeUnknown(t *testing.T) {
 	api := newFakeAPI()
 	api.statuses = []string{statusComplete}
 	api.noPod = true
@@ -214,8 +230,33 @@ func TestRunCompleteWithNoPodStillSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ExitCode != 0 || res.Stdout != "" {
-		t.Errorf("result = %+v, want exit 0 (Complete) and no log", res)
+	if res.ExitCode != exitCodeUnknown || res.Stdout != "" {
+		t.Errorf("result = %+v, want unknown exit code (Complete, pod unreadable) and no log", res)
+	}
+}
+
+func TestRunSuccessDeletesJobEvenIfContextExpiresDuringLogCollection(t *testing.T) {
+	api := newFakeAPI()
+	api.statuses = []string{statusPending, statusComplete}
+	srv := httptest.NewServer(api.handler(t))
+	defer srv.Close()
+	l := newLauncher(srv, Options{})
+
+	// Cancel context during pod log collection, after Job is Complete.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api.onPodLogAfterComplete = cancel
+
+	res, err := l.Run(ctx, specFor("/data/agents/sandbox/deps-123"))
+	// Run should succeed: context expires during collection but cleanup uses a fresh context.
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", res.ExitCode)
+	}
+	if !api.deleted {
+		t.Error("Job must be deleted even if context expires during log collection")
 	}
 }
 
@@ -297,6 +338,7 @@ func TestManifestShape(t *testing.T) {
 		Tolerations:         []Toleration{{Key: "spyre", Operator: "Exists", Effect: "NoSchedule"}},
 		Resources:           Resources{Limits: map[string]string{"ibm.com/spyre_pf": "2"}},
 		ServiceAccount:      "hive",
+		SchedulerName:       "spyre-scheduler",
 		EnvFromSecrets:      []string{"artifact-registry"},
 		ExtraVolumes:        []VolumeMount{{Claim: "compile-cache", MountPath: "/cache", ReadOnly: true}},
 	})
@@ -311,11 +353,16 @@ func TestManifestShape(t *testing.T) {
 		`"ttlSecondsAfterFinished":3600`,
 		`"restartPolicy":"Never"`,
 		`"nodeSelector":{"accelerator":"spyre"}`,
+		`"schedulerName":"spyre-scheduler"`,
 		// The fake decodes the manifest into a map before we re-marshal it
 		// here, so keys come back alphabetical regardless of struct order.
 		`"tolerations":[{"effect":"NoSchedule","key":"spyre","operator":"Exists"}]`,
 		`"limits":{"ibm.com/spyre_pf":"2"}`,
 		`"serviceAccountName":"hive"`,
+		`"automountServiceAccountToken":false`,
+		`"allowPrivilegeEscalation":false`,
+		`"capabilities":{"drop":["ALL"]}`,
+		`"seccompProfile":{"type":"RuntimeDefault"}`,
 		`"envFrom":[{"secretRef":{"name":"artifact-registry"}}]`,
 		`"claimName":"hive-data"`,
 		`"subPath":"agents/sandbox/deps-123"`,
@@ -590,5 +637,34 @@ func TestSortedKeysAndSanitize(t *testing.T) {
 func TestOptionsValidateAcceptsMinimal(t *testing.T) {
 	if err := (Options{WorkspaceClaim: "hive-data", ExtraVolumes: []VolumeMount{{Claim: "c", MountPath: "/m"}}}).Validate(); err != nil {
 		t.Errorf("Validate = %v", err)
+	}
+}
+
+func TestManifestCopiesAllowlistedEnv(t *testing.T) {
+	t.Setenv("HIVE_TEST_FOO", "bar")
+	t.Setenv("HIVE_TEST_OVERRIDE", "from-process")
+	t.Setenv("HIVE_TEST_UNLISTED", "nope")
+	t.Setenv("HIVE_TEST_API_TOKEN", "leak")
+	api := newFakeAPI()
+	api.statuses = []string{statusComplete}
+	srv := httptest.NewServer(api.handler(t))
+	defer srv.Close()
+	l := newLauncher(srv, Options{})
+	spec := specFor("/data/agents/sandbox/deps-123")
+	spec.Env = map[string]string{"HIVE_TEST_OVERRIDE": "explicit", "GITHUB_TOKEN": "leak"}
+	spec.EnvAllowlist = []string{"HIVE_TEST_FOO", "HIVE_TEST_OVERRIDE", "HIVE_TEST_API_TOKEN"}
+	if _, err := l.Run(context.Background(), spec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	raw, _ := json.Marshal(api.created)
+	m := string(raw)
+	want := `"env":[{"name":"HIVE_TEST_FOO","value":"bar"},{"name":"HIVE_TEST_OVERRIDE","value":"explicit"}]`
+	if !strings.Contains(m, want) {
+		t.Errorf("manifest missing %s\n%s", want, m)
+	}
+	for _, leak := range []string{"HIVE_TEST_UNLISTED", "HIVE_TEST_API_TOKEN", "GITHUB_TOKEN", "leak", "from-process"} {
+		if strings.Contains(m, leak) {
+			t.Errorf("%q reached the Job manifest:\n%s", leak, m)
+		}
 	}
 }

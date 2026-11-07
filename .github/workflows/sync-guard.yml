@@ -1,8 +1,9 @@
 name: Sync guard
 
-# The Go code in this repository is produced by hivecommons/hive's
-# crux-sync workflow from src/crux there. A pull request here that edits Go
-# code would be overwritten by the next sync, so it is refused with a pointer
+# Everything in this repository except the KEEP paths of crux-publish.sh
+# (Go code, module files, Makefile, scripts, testdata, docs, ...)
+# are produced by hivecommons/hive's crux-sync workflow from src/crux there.
+# Edits here would be overwritten by the next sync, so they are refused with a pointer
 # to the source of truth. Scaffolding (.github/, .goreleaser.yaml, Dockerfile,
 # README.md, LICENSE) is maintained here and passes.
 
@@ -19,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Refuse Go edits from non-sync actors
+      - name: Refuse sync-owned edits from non-sync actors
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -29,23 +30,29 @@ jobs:
           set -euo pipefail
           # The sync pushes straight to main (no PR), so any PR here is by
           # definition not the sync. Keep an allowlist anyway for a future
-          # PR-based sync actor.
+          # PR-based sync actor. Quote the patterns: unquoted, [bot] is a
+          # bracket expression that matches one of b/o/t, not the literal.
+          # Only the sync actor belongs here: hivecommons-hive[bot] is the
+          # hive agent App and opens ordinary code PRs. Exempting it let #71
+          # merge sync-owned files that the next sync then erased (#72).
           case "$ACTOR" in
-            hive-release[bot]|hivecommons-hive[bot]) echo "sync actor $ACTOR; skipping"; exit 0 ;;
+            "hive-release[bot]") echo "sync actor $ACTOR; skipping"; exit 0 ;;
           esac
           files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --paginate --jq '.[].filename')"
-          go_files="$(printf '%s\n' "$files" | grep -E '(\.go|^go\.mod|^go\.sum|^\.hive-sync)$' || true)"
-          if [ -z "$go_files" ]; then
-            echo "No Go/module files touched; scaffolding-only change is fine here."
+          # Allowlist mirroring KEEP in hive's src/scripts/crux-publish.sh: anything
+          # else is deleted and re-copied on publish, so it is sync-owned.
+          sync_files="$(printf '%s\n' "$files" | grep -vE '^(\.github/|runbooks/|\.goreleaser\.yaml$|Dockerfile$|Dockerfile\.goreleaser$|LICENSE$|README\.md$|\.gitignore$|\.golangci\.yml$|\.dockerignore$)' || true)"
+          if [ -z "$sync_files" ]; then
+            echo "No sync-owned files touched; scaffolding-only change is fine here."
             exit 0
           fi
           marker="<!-- crux-sync-guard -->"
           # shellcheck disable=SC2016
-          list="$(printf '%s\n' "$go_files" | sed 's/^/- `/; s/$/`/')"
+          list="$(printf '%s\n' "$sync_files" | sed 's/^/- `/; s/$/`/')"
           body="$marker
           ### This repository is a synced copy
 
-          The Go code here is generated from [\`hivecommons/hive\` \`src/crux\`](https://github.com/hivecommons/hive/tree/v5/src/crux) by hive's \`crux-sync\` workflow and would be overwritten by the next sync. Please open this change as a pull request against **hivecommons/hive** (base \`v5\`, under \`src/crux/\`); it will be published here automatically once it merges.
+          The Go code, module files, \`Makefile\` and \`docs/MODULE.md\` here are generated from [\`hivecommons/hive\` \`src/crux\`](https://github.com/hivecommons/hive/tree/v5/src/crux) by hive's \`crux-sync\` workflow and would be overwritten by the next sync. Please open this change as a pull request against **hivecommons/hive** (base \`v5\`, under \`src/crux/\`); it will be published here automatically once it merges.
 
           Files this PR touches that are owned by the sync:
           $list
@@ -53,11 +60,18 @@ jobs:
           Only scaffolding is maintained in this repository: \`.github/\`, \`.goreleaser.yaml\`, \`Dockerfile\`, \`README.md\`, \`LICENSE\`."
           # Strip the YAML indentation the lines above carry.
           body="$(printf '%s\n' "$body" | sed 's/^          //')"
-          existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)"
+          # Attempt to post/update the comment, but on fork PRs the GITHUB_TOKEN is read-only
+          # and the call will fail with 403; treat it as best-effort so the ::error:: below runs.
+          posted=1
+          # Guard lookup against transient API failures (rate limit, 5xx) so whole path is best-effort.
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1 || true)"
           if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$body" >/dev/null
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$body" >/dev/null || posted=0
           else
-            gh pr comment "$PR" --body "$body"
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body" || posted=0
           fi
-          echo "::error::PR touches sync-owned files ($(printf '%s' "$go_files" | tr '\n' ' ')). Source of truth is hivecommons/hive src/crux."
+          if [ "$posted" = 0 ]; then
+            echo "::warning::could not post the sync-guard comment (GITHUB_TOKEN is read-only on pull_request runs from forks); the pointer follows as an error annotation instead."
+          fi
+          echo "::error::PR touches sync-owned files ($(printf '%s' "$sync_files" | tr '\n' ' ')). Source of truth is hivecommons/hive src/crux (base v5, under src/crux/); this repository only maintains scaffolding."
           exit 1
